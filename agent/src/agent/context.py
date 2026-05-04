@@ -1,4 +1,4 @@
-"""ContextBuilder: builds LLM message context for the ReAct AgentLoop."""
+"""ContextBuilder: 为 ReAct AgentLoop 构建 LLM 消息上下文."""
 
 from __future__ import annotations
 
@@ -16,74 +16,76 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """You are a finance research agent with {skill_count} specialist skills, {tool_count} tools, 5 data sources (with auto-fallback), and 29 multi-agent swarm teams.
-You handle backtesting, factor analysis, options pricing, risk audits, research reports, document/web reading, web search, and team-based workflows.
+# 系统提示词模板，包含技能数量、工具数量、内存摘要等占位符
+_SYSTEM_PROMPT = """你是一个金融研究代理，拥有 {skill_count} 个专业技能、{tool_count} 个工具、5 个数据源（带自动回退）和 29 个多代理 swarm 团队。
+你负责回测、因子分析、期权定价、风险审计、研究报告、文档/网页阅读、网络搜索和团队工作流。
 
-## Tools
+## 工具
 
 {tool_descriptions}
 
-## Skills (use load_skill to read full docs)
+## 技能（使用 load_skill 读取完整文档）
 
 {skill_descriptions}
 
-## State
+## 状态
 
 {memory_summary}
 
-## Task Routing
+## 任务路由
 
-Decide which workflow to use based on the request:
+根据请求决定使用哪个工作流：
 
-**Backtest** — user wants to create, test, or optimize a trading strategy:
-1. `load_skill("strategy-generate")` — read the SignalEngine contract
-2. `write_file("config.json", ...)` — source, codes, dates, parameters
-3. `write_file("code/signal_engine.py", ...)` — SignalEngine class
-4. Syntax check → `backtest(run_dir=...)` → `read_file("artifacts/metrics.csv")`
-5. Do NOT write run_backtest.py. The engine is built-in.
+**回测** — 用户想要创建、测试或优化交易策略：
+1. `load_skill("strategy-generate")` — 读取 SignalEngine 合约
+2. `write_file("config.json", ...)` — 数据源、代码、日期、参数
+3. `write_file("code/signal_engine.py", ...)` — SignalEngine 类
+4. 语法检查 → `backtest(run_dir=...)` → `read_file("artifacts/metrics.csv")`
+5. 不要写 run_backtest.py。引擎是内置的。
 
-**Swarm team** — ONLY when the user explicitly requests team/committee/swarm analysis:
-- Call `run_swarm(prompt="<user's full request>")` — it auto-selects the right preset.
-- Do NOT use swarm unless the user specifically asks for team-based or committee analysis.
+**Swarm 团队** — 仅当用户明确要求团队/委员会/swarm 分析时：
+- 调用 `run_swarm(prompt="<用户完整请求>")` — 它会自动选择正确的预设。
+- 除非用户特别要求基于团队或委员会的分析，否则不要使用 swarm。
 
-**Analysis / research** — user wants factor analysis, options pricing, market data, or general research:
-- Load the relevant skill first, then use the matching tool (factor_analysis, options_pricing, bash for custom scripts).
+**分析/研究** — 用户想要因子分析、期权定价、市场数据或一般研究：
+- 先加载相关技能，然后使用匹配的工具（factor_analysis、options_pricing、bash 执行自定义脚本）。
 
-**Document / web** — user provides a PDF or URL:
-- `read_document(path=...)` for PDFs, `read_url(url=...)` for web pages.
+**文档/网页** — 用户提供 PDF 或 URL：
+- 使用 `read_document(path=...)` 读取 PDF，`read_url(url=...)` 读取网页。
 
-**Trade journal** — user uploads a CSV/Excel broker export (交割单) or asks to analyze their own trading history:
-1. `load_skill("trade-journal")` — read analysis methodology and report templates
-2. `analyze_trade_journal(file_path=..., analysis_type="full")` — parse + profile + behavior diagnostics
-3. Present results as the markdown report in the skill. Offer follow-ups: time-slice, symbol deep-dive, market split.
-4. If the user asks "now what / can I do better / what if I had discipline", switch to the **Shadow Account** flow below.
+**交易日志** — 用户上传 CSV/Excel 经纪商导出（交割单）或要求分析自己的交易历史：
+1. `load_skill("trade-journal")` — 读取分析方法和报告模板
+2. `analyze_trade_journal(file_path=..., analysis_type="full")` — 解析 + 分析 + 行为诊断
+3. 以技能中的 markdown 报告形式呈现结果。提供后续选项：时间段分析、标的深入、市场拆分。
+4. 如果用户问"现在怎么办/我能做得更好吗/如果我有纪律会怎样"，切换到下面的 **Shadow Account** 流程。
 
-**Shadow Account** — user asks to extract their strategy, "train a shadow", multi-market backtest their own profitable pattern, or ask "how much am I leaving on the table":
-1. **MUST** `load_skill("shadow-account")` as the FIRST tool call before any shadow_* tool — the skill defines rules, methodology, attribution semantics, and is required context
-2. Confirm the journal has been parsed (same session or known `journal_path`). If not, run `analyze_trade_journal` first.
-3. `extract_shadow_strategy(journal_path=...)` → show rules, ask user to confirm they look like their own behavior
-4. `run_shadow_backtest(shadow_id=..., journal_path=...)` → multi-market metrics + delta attribution
-5. `render_shadow_report(shadow_id=...)` → share html/pdf path, lead with the Section 5 "you vs shadow" delta
-6. Optional: `scan_shadow_signals(shadow_id=...)` on request (always attach the research-only disclaimer)
-**Never** call `extract_shadow_strategy` / `run_shadow_backtest` / `render_shadow_report` / `scan_shadow_signals` without first loading the `shadow-account` skill in the same session.
+**Shadow Account** — 用户要求提取策略、"训练 shadow"、多市场回测自己的盈利模式，或问"我放弃了多少"：
+1. **必须** `load_skill("shadow-account")` 作为第一个工具调用，在任何 shadow_* 工具之前 — 技能定义了规则、方法论、归属语义，是必需上下文
+2. 确认日志已被解析（同一会话或已知 `journal_path`）。如果没有，先运行 `analyze_trade_journal`
+3. `extract_shadow_strategy(journal_path=...)` → 显示规则，请用户确认是否符合他们的行为
+4. `run_shadow_backtest(shadow_id=..., journal_path=...)` → 多市场指标 + delta 归属
+5. `render_shadow_report(shadow_id=...)` → 分享 html/pdf 路径，以第 5 节 "你 vs shadow" delta 开头
+6. 可选：应要求 `scan_shadow_signals(shadow_id=...)`（始终附上研究免责声明）
+**切勿** 在未先在同一会话中加载 `shadow-account` 技能的情况下调用 `extract_shadow_strategy` / `run_shadow_backtest` / `render_shadow_report` / `scan_shadow_signals`。
 
-## Guidelines
+## 指南
 
-- Load the relevant skill BEFORE starting any task. Skills contain the exact API contracts and examples.
-- Ask the user if critical info is missing (assets, dates, strategy type). Never guess.
-- Output results as markdown tables. After backtest, always report: total_return, sharpe, max_drawdown, trade_count.
-- All file paths are relative to run_dir (auto-injected).
-- Respond in the same language the user used.
-- You have persistent cross-session memory (`remember` tool). When the user shares preferences, strategy insights, or important findings, save them for future sessions.
-- You can create reusable skills (`save_skill`) when a workflow succeeds, and fix them (`patch_skill`) when APIs change.
+- 在开始任何任务之前加载相关技能。技能包含精确的 API 合约和示例。
+- 如果关键信息缺失（资产、日期、策略类型），请询问用户。不要猜测。
+- 以 markdown 表格形式输出结果。回测后始终报告：total_return、sharpe、max_drawdown、trade_count。
+- 所有文件路径都相对于 run_dir（自动注入）。
+- 使用用户使用的相同语言回复。
+- 你有跨会话的持久记忆（`remember` 工具）。当用户分享偏好、策略见解或重要发现时，保存它们以供将来会话使用。
+- 当工作流成功时，你可以创建可重用的技能（`save_skill`），并在 API 变化时修复它们（`patch_skill`）。
 {memory_section}
-## Current Date & Time
+## 当前日期和时间
 
-Today is {current_datetime}.
+今天是 {current_datetime}。
 """
 
+# 持久化内存部分的模板
 _MEMORY_SECTION = """
-## Persistent Memory (cross-session)
+## 持久化内存（跨会话）
 
 {snapshot}
 
@@ -91,24 +93,24 @@ _MEMORY_SECTION = """
 
 
 class ContextBuilder:
-    """Builds message context for AgentLoop.
+    """为 AgentLoop 构建消息上下文.
 
-    Attributes:
-        registry: Tool registry.
-        memory: Workspace memory.
-        skills_loader: Skills loader.
+    属性:
+        registry: 工具注册表.
+        memory: 工作区内存.
+        skills_loader: 技能加载器.
     """
 
     def __init__(self, registry: ToolRegistry, memory: WorkspaceMemory,
                  skills_loader: Optional[SkillsLoader] = None,
                  persistent_memory: Optional[PersistentMemory] = None) -> None:
-        """Initialize ContextBuilder.
+        """初始化 ContextBuilder.
 
         Args:
-            registry: Tool registry.
-            memory: Workspace memory.
-            skills_loader: Skills loader (auto-created if not provided).
-            persistent_memory: PersistentMemory instance for cross-session recall.
+            registry: 工具注册表.
+            memory: 工作区内存.
+            skills_loader: 技能加载器（未提供则自动创建）.
+            persistent_memory: 跨会话记忆的 PersistentMemory 实例.
         """
         self.registry = registry
         self.memory = memory
@@ -116,20 +118,20 @@ class ContextBuilder:
         self._persistent_memory = persistent_memory
 
     def build_system_prompt(self, user_message: str = "") -> str:
-        """Build system prompt.
+        """构建系统提示词.
 
-        Injects one-line skill summaries via get_descriptions; full docs loaded on demand by load_skill.
-        PersistentMemory snapshot is frozen at session start (preserves prompt cache).
+        通过 get_descriptions 注入单行技能摘要；完整文档在需要时通过 load_skill 加载.
+        PersistentMemory 快照在会话开始时冻结（保留提示词缓存）.
 
         Args:
-            user_message: User message (kept for API compatibility).
+            user_message: 用户消息（为保持 API 兼容性而保留）.
 
         Returns:
-            System prompt text.
+            系统提示词文本.
         """
         now = datetime.now()
 
-        # Build memory section only if there are saved memories
+        # 仅在有保存的记忆时构建内存部分
         memory_section = ""
         if self._persistent_memory and self._persistent_memory.snapshot:
             memory_section = _MEMORY_SECTION.format(
@@ -147,18 +149,17 @@ class ContextBuilder:
         )
 
     def build_messages(self, user_message: str, history: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-        """Build full message list.
+        """构建完整的消息列表.
 
-        Auto-recalls relevant persistent memories and injects them into the
-        user message as context. This keeps the system prompt stable (cacheable)
-        while providing per-query relevant memories.
+        自动召回相关的持久记忆并将其作为上下文注入用户消息.
+        这保持了系统提示词的稳定（可缓存）同时提供每个查询相关的记忆.
 
         Args:
-            user_message: User message.
-            history: Prior conversation messages.
+            user_message: 用户消息.
+            history: 之前的对话消息.
 
         Returns:
-            OpenAI-format message list.
+            OpenAI 格式的消息列表.
         """
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self.build_system_prompt(user_message)},
@@ -166,7 +167,7 @@ class ContextBuilder:
         if history:
             messages.extend(history)
 
-        # Auto-recall: inject relevant memories into user message
+        # 自动召回：将相关记忆注入用户消息
         enriched = user_message
         if self._persistent_memory:
             try:
@@ -179,28 +180,28 @@ class ContextBuilder:
                         f"{user_message}"
                     )
             except Exception as exc:
-                logger.debug("Auto-recall failed: %s", exc)
+                logger.debug("自动召回失败: %s", exc)
 
         messages.append({"role": "user", "content": enriched})
         return messages
 
     def _format_tool_descriptions(self) -> str:
-        """Format tool descriptions."""
+        """格式化工具描述."""
         lines = []
         for tool in self.registry._tools.values():
             params = tool.parameters.get("properties", {})
             required = tool.parameters.get("required", [])
             param_parts = []
             for pname, pschema in params.items():
-                req = " (required)" if pname in required else ""
+                req = " (必填)" if pname in required else ""
                 param_parts.append(f"    - {pname}: {pschema.get('description', pschema.get('type', ''))}{req}")
-            param_text = "\n".join(param_parts) if param_parts else "    (no params)"
-            lines.append(f"### {tool.name}\n{tool.description}\n  Params:\n{param_text}")
+            param_text = "\n".join(param_parts) if param_parts else "    (无参数)"
+            lines.append(f"### {tool.name}\n{tool.description}\n  参数:\n{param_text}")
         return "\n\n".join(lines)
 
     @staticmethod
     def format_tool_result(tool_call_id: str, tool_name: str, result: str) -> Dict[str, Any]:
-        """Format a tool execution result as a message."""
+        """将工具执行结果格式化为消息."""
         return {
             "role": "tool",
             "tool_call_id": tool_call_id,
@@ -214,18 +215,16 @@ class ContextBuilder:
         content: Optional[str] = None,
         reasoning_content: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Format an assistant tool_calls message, preserving thinking text.
+        """格式化助手 tool_calls 消息，保留思考文本.
 
         Args:
-            tool_calls: List of tool call objects.
-            content: Final assistant text (may include inlined thinking for
-                providers that stream reasoning as content).
-            reasoning_content: Provider-specific reasoning field (Kimi K2.5,
-                DeepSeek reasoner, Qwen thinking). Only attached to the output
-                message when not None, so non-thinking providers see no change.
+            tool_calls: 工具调用对象列表.
+            content: 助手的最终文本（对于将思考作为内容流式传输的提供商可能包含内联思考）.
+            reasoning_content: 提供商特定的思考字段（Kimi K2.5、DeepSeek reasoner、Qwen thinking）.
+                仅在非 None 时附加到输出消息，因此非思考提供商不会有任何变化.
 
         Returns:
-            OpenAI-format assistant message.
+            OpenAI 格式的助手消息.
         """
         message = {
             "role": "assistant",

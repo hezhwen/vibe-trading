@@ -1,14 +1,14 @@
-"""AgentLoop: ReAct core loop.
+"""AgentLoop: ReAct 核心循环
 
-Five-layer context management:
-  Layer 1 (microcompact)     — silently prunes old tool results each iteration
-  Layer 2 (context_collapse) — folds long text blocks without LLM call (zero cost)
-  Layer 3 (auto_compact)     — LLM structured summary with token-budget tail protection
-  Layer 4 (compact tool)     — model explicitly calls the compact tool to trigger L3
-  Layer 5 (iterative update) — Nth compression updates previous summary instead of starting fresh
+五层上下文管理：
+  Layer 1 (microcompact)     — 每次迭代静默清除旧的工具结果
+  Layer 2 (context_collapse) — 无需 LLM 调用即可折叠长文本块（零成本）
+  Layer 3 (auto_compact)     — 带 token 预算尾部保护的 LLM 结构化摘要
+  Layer 4 (compact tool)    — 模型显式调用 compact 工具触发 L3
+  Layer 5 (iterative update) — 第 N 次压缩时更新之前的摘要，而非重新开始
 
-Tool execution:
-  - Read/write batching: consecutive readonly tools run in parallel via threads
+工具执行：
+  - 读/写批处理：连续只读工具通过线程并行运行
 """
 
 from __future__ import annotations
@@ -60,10 +60,10 @@ def estimate_tokens(messages: list) -> int:
 
 
 def _microcompact(messages: list) -> None:
-    """Layer 1: silently prune old tool results, keeping the most recent N intact.
+    """Layer 1: 静默清除旧的工具结果，只保留最近 N 条完整内容
 
     Args:
-        messages: Message list (mutated in place).
+        messages: 消息列表（原地修改）
     """
     tool_msgs = [m for m in messages if m.get("role") == "tool"]
     if len(tool_msgs) <= KEEP_RECENT:
@@ -75,13 +75,13 @@ def _microcompact(messages: list) -> None:
 
 
 def _context_collapse(messages: list) -> None:
-    """Layer 2: fold long text blocks in older messages without LLM call.
+    """Layer 2: 对旧消息中的长文本块进行折叠，无需 LLM 调用
 
-    Preserves head + tail of large text, collapses the middle.
-    Zero API cost — pure string operation.
+    保留大段文本的头部和尾部，中间部分折叠。
+    零 API 成本 — 纯字符串操作。
 
     Args:
-        messages: Message list (mutated in place).
+        messages: 消息列表（原地修改）
     """
     if len(messages) <= COLLAPSE_PRESERVE_RECENT + 1:
         return
@@ -98,16 +98,22 @@ def _context_collapse(messages: list) -> None:
 
 
 def _fix_tool_pairs(messages: list) -> None:
-    """Repair orphaned tool_call / tool_result pairs after compression.
+    """压缩后修复孤立的 tool_call / tool_result 配对
 
-    Two fixes:
-      1. Remove tool results whose matching tool_call was compressed away.
-      2. Insert stub results for tool_calls whose results were compressed away.
+    保持 tool_call 和 tool_result 配对完整，避免：
+
+    模型看到没有结果的调用（会困惑）
+    模型看到没有对应调用的结果（同样困惑）
+    压缩后插入的 stub 是合理的占位符，让模型知道这个调用曾经发生且有结果，只是在更早的上下文中被压缩了。
+
+    两种修复：
+      1. 删除匹配的工具调用已被压缩掉的结果
+      2. 为结果已被压缩掉的工具调用插入存根结果
 
     Args:
-        messages: Message list (mutated in place).
+        messages: 消息列表（原地修改）
     """
-    # Collect all tool_call IDs from assistant messages
+    # 从 assistant 消息中收集所有 tool_call ID
     call_ids: set[str] = set()
     for msg in messages:
         if msg.get("role") == "assistant":
@@ -116,7 +122,7 @@ def _fix_tool_pairs(messages: list) -> None:
                 if tc_id:
                     call_ids.add(tc_id)
 
-    # Remove orphaned tool results
+    # 删除孤立的结果
     i = 0
     while i < len(messages):
         msg = messages[i]
@@ -125,7 +131,7 @@ def _fix_tool_pairs(messages: list) -> None:
         else:
             i += 1
 
-    # Collect existing result IDs
+    # 收集现有的结果 ID
     result_ids: set[str] = set()
     for msg in messages:
         if msg.get("role") == "tool":
@@ -133,7 +139,7 @@ def _fix_tool_pairs(messages: list) -> None:
             if tcid:
                 result_ids.add(tcid)
 
-    # Insert stub results for orphaned tool_calls
+    # 为孤立的 tool_calls 插入存根结果
     inserts: list[tuple[int, dict]] = []
     for idx, msg in enumerate(messages):
         if msg.get("role") != "assistant":
@@ -309,17 +315,39 @@ class AgentLoop:
         self._cancelled = True
 
     def run(self, user_message: str, history: Optional[List[Dict[str, Any]]] = None, session_id: str = "") -> Dict[str, Any]:
-        """Run the ReAct loop synchronously.
+        """同步运行 ReAct 循环
 
         Args:
-            user_message: User message.
-            history: Prior conversation messages.
-            session_id: Session ID.
+            user_message: 用户消息
+            history: 之前的对话消息
+            session_id: 会话 ID
 
         Returns:
-            Execution result dict.
+            执行结果字典
+
+        1.初始化
+        重置状态（取消标记、已调用工具集合）
+        创建运行目录并保存请求
+        构建消息上下文（通过 ContextBuilder）
+        
+        2.ReAct 循环（最多 max_iterations 次迭代）
+        Layer 1: _microcompact — 精简每次迭代的消息
+        Layer 2: _context_collapse — token 超过阈值时折叠长文本
+        Layer 3: auto_compact — 超过 token 上限时的压缩
+
+        3.LLM 调用
+        流式调用 llm.stream_chat，收集思考文本
+        无工具调用时直接返回结果
+
+        4. 工具执行
+        _process_tool_calls 执行工具调用（支持读/写批处理）
+        工具执行后可触发手动压缩
+
+        5.收尾
+        写入 trace 和状态（success/failed/cancelled）
+        6.返回结果字典
         """
-        # Reset per-run state (safe for reuse across multiple run() calls)
+        # 重置每次运行的状态（支持多次调用 run()）
         self._cancelled = False
         self._called_ok = set()
         self._previous_summary = ""
@@ -327,6 +355,7 @@ class AgentLoop:
         state_store = RunStateStore()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
+        # 确定运行目录：优先使用 memory 中已存在的，否则创建新的
         if self.memory.run_dir and Path(self.memory.run_dir).exists():
             run_dir = Path(self.memory.run_dir)
         else:
@@ -350,12 +379,12 @@ class AgentLoop:
             while iteration < self.max_iterations:
                 if self._cancelled:
                     trace.write({"type": "cancelled", "iter": iteration})
-                    logger.info("AgentLoop cancelled by user")
+                    logger.info("AgentLoop 被用户取消")
                     break
 
                 iteration += 1
 
-                # Inject background task notifications
+                # 注入后台任务通知
                 bg = get_background_manager()
                 notifs = bg.drain_notifications()
                 if notifs:
@@ -363,23 +392,23 @@ class AgentLoop:
                     messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
                     messages.append({"role": "assistant", "content": "Noted background results."})
 
-                # Layer 1: microcompact (every iteration)
+                # Layer 1: microcompact（每次迭代）
                 _microcompact(messages)
 
-                # Layer 2: context collapse (fold long text, zero API cost)
+                # Layer 2: context collapse（折叠长文本，零 API 成本）
                 tokens = estimate_tokens(messages)
                 if tokens > COLLAPSE_THRESHOLD:
                     _context_collapse(messages)
                     tokens = estimate_tokens(messages)
 
-                # Layer 3: auto_compact (token threshold exceeded)
+                # Layer 3: auto_compact（超过 token 阈值时触发）
                 if tokens > TOKEN_THRESHOLD:
-                    logger.info(f"Auto compact triggered: {tokens} tokens > {TOKEN_THRESHOLD}")
+                    logger.info(f"Auto compact 触发: {tokens} tokens > {TOKEN_THRESHOLD}")
                     self._auto_compact(messages, run_dir, trace)
 
-                logger.info(f"ReAct iteration {iteration}/{self.max_iterations}")
+                logger.info(f"ReAct 迭代 {iteration}/{self.max_iterations}")
 
-                # Streaming output + collect thinking text
+                # 流式输出 + 收集思考文本
                 thinking_chunks: List[str] = []
 
                 def _on_text_chunk(delta: str) -> None:
@@ -397,6 +426,7 @@ class AgentLoop:
                     trace.write({"type": "thinking", "iter": iteration, "content": thinking_text[:2000]})
                     self._emit("thinking_done", {"iter": iteration, "content": thinking_text[:500]})
 
+                # 无工具调用时，直接返回结果
                 if not response.has_tool_calls:
                     final_content = response.content or ""
                     trace.write({"type": "answer", "iter": iteration, "content": final_content[:2000]})
@@ -411,18 +441,18 @@ class AgentLoop:
                     )
                 )
 
-                # Execute tools with read/write batching
+                # 执行工具（支持读/写批处理）
                 compact_requested, focus_topic = self._process_tool_calls(
                     response.tool_calls, context, messages, trace, react_trace, iteration,
                 )
 
-                # Layer 3: compress after all tools have executed
+                # Layer 3: 所有工具执行完成后进行压缩
                 if compact_requested:
-                    logger.info("Manual compact triggered by model")
+                    logger.info("模型触发了手动压缩")
                     self._auto_compact(messages, run_dir, trace, focus_topic=focus_topic)
 
         except Exception as exc:
-            logger.exception(f"AgentLoop error: {exc}")
+            logger.exception(f"AgentLoop 错误: {exc}")
             trace.write({"type": "end", "status": "error", "reason": str(exc), "iterations": iteration})
             trace.close()
             state_store.mark_failure(run_dir, str(exc))
@@ -435,7 +465,7 @@ class AgentLoop:
                 "react_trace": react_trace,
             }
 
-        # Determine final status
+        # 确定最终状态
         if self._cancelled:
             state_store.mark_failure(run_dir, "cancelled by user")
             final_status = "cancelled"
@@ -468,25 +498,25 @@ class AgentLoop:
         react_trace: list,
         iteration: int,
     ) -> tuple[bool, str]:
-        """Pre-process tool calls: handle compact, filter duplicates, batch execute.
+        """预处理工具调用：处理 compact、过滤重复、批处理执行
 
         Args:
-            tool_calls: Raw tool calls from LLM response.
-            context: ContextBuilder for formatting messages.
-            messages: Conversation messages (appended in place).
-            trace: TraceWriter.
-            react_trace: React trace list.
-            iteration: Current iteration number.
+            tool_calls: LLM 响应中的原始工具调用
+            context: 用于格式化消息的 ContextBuilder
+            messages: 对话消息（原地追加）
+            trace: TraceWriter
+            react_trace: React 追踪列表
+            iteration: 当前迭代次数
 
         Returns:
-            Tuple of (compact_requested, focus_topic).
+            (compact_requested, focus_topic) 元组
         """
         compact_requested = False
         focus_topic = ""
         to_execute = []
 
         for tc in tool_calls:
-            # Layer 4: compact tool — mark then defer execution
+            # Layer 4: compact 工具 — 标记后延迟执行
             if tc.name == "compact":
                 compact_requested = True
                 focus_topic = tc.arguments.get("focus_topic", "")
@@ -496,8 +526,9 @@ class AgentLoop:
 
             tool_def = self.registry.get(tc.name)
             is_repeatable = tool_def.repeatable if tool_def else False
+            # 阻止已成功执行的非重复工具（防止重复调用）
             if tc.name in self._called_ok and not is_repeatable:
-                logger.warning(f"Blocked duplicate call: {tc.name} (already succeeded)")
+                logger.warning(f"阻止重复调用: {tc.name} (已成功执行过)")
                 skip_msg = json.dumps({"skipped": True, "reason": f"{tc.name} already completed successfully. Use the previous result."})
                 messages.append(context.format_tool_result(tc.id, tc.name, skip_msg))
                 trace.write({"type": "tool_skipped", "iter": iteration, "tool": tc.name})
@@ -509,7 +540,7 @@ class AgentLoop:
         if not to_execute:
             return compact_requested, focus_topic
 
-        # Batch execute: consecutive readonly → parallel, write → serial
+        # 批处理执行：单个直接执行，多个则分批处理
         if len(to_execute) == 1:
             self._execute_single(to_execute[0], context, messages, trace, react_trace, iteration)
         else:
@@ -526,20 +557,20 @@ class AgentLoop:
         react_trace: list,
         iteration: int,
     ) -> None:
-        """Execute tools with read/write batching.
+        """使用读/写批处理执行工具
 
-        Consecutive readonly tools run in parallel via ThreadPoolExecutor.
-        Write tools run serially between readonly batches.
+        连续只读工具通过 ThreadPoolExecutor 并行运行
+        写工具在只读批次之间串行运行
 
         Args:
-            tool_calls: Tool calls to execute.
-            context: ContextBuilder.
-            messages: Conversation messages.
-            trace: TraceWriter.
-            react_trace: React trace list.
-            iteration: Current iteration.
+            tool_calls: 要执行的工具调用
+            context: ContextBuilder
+            messages: 对话消息
+            trace: TraceWriter
+            react_trace: React 追踪列表
+            iteration: 当前迭代次数
         """
-        # Split into batches: consecutive readonly → parallel, write → serial
+        # 分批：连续的只读工具 → 并行执行，写工具 → 串行执行
         batches: list[tuple[str, list]] = []
         current_ro: list = []
 
@@ -683,22 +714,22 @@ class AgentLoop:
 
     def _auto_compact(self, messages: list, run_dir: Path, trace: TraceWriter,
                       focus_topic: str = "") -> None:
-        """Layer 3/4/5: structured LLM summary with token-budget tail protection.
+        """Layer 3/4/5: 带 token 预算尾部保护的结构化 LLM 摘要
 
-        Upgrades over the original:
-          - Token-budget tail: keeps ~20K tokens of recent messages (not a fixed count).
-          - Structured summary template: preserves goal, progress, decisions, files, etc.
-          - Iterative update: Nth compression updates previous summary, zero info decay.
-          - Tool pair fix: repairs orphaned tool_call/tool_result after compression.
-          - Focus-topic: optionally prioritize specific topic in summary.
+        相比原始版本的升级：
+          - Token 预算尾部：保留约 20K token 的最近消息（而非固定数量）
+          - 结构化摘要模板：保留目标、进度、决策、文件等信息
+          - 迭代更新：第 N 次压缩时更新之前的摘要，零信息衰减
+          - 工具配对修复：压缩后修复孤立的 tool_call/tool_result
+          - Focus-topic：可选择在摘要中优先处理特定主题
 
         Args:
-            messages: Message list (replaced in place).
-            run_dir: Run directory.
-            trace: TraceWriter.
-            focus_topic: Optional topic to prioritize in the summary.
+            messages: 消息列表（原地替换）
+            run_dir: 运行目录
+            trace: TraceWriter
+            focus_topic: 可选，摘要中优先处理的主题
         """
-        # Save full transcript before compressing
+        # 压缩前保存完整记录
         transcript_path = run_dir / f"transcript_{int(_time.time())}.jsonl"
         with open(transcript_path, "w", encoding="utf-8") as f:
             for msg in messages:
@@ -707,7 +738,7 @@ class AgentLoop:
         system_msg = messages[0]
         body = messages[1:]
 
-        # Token-budget tail: walk backward to find how many recent messages to preserve
+        # Token 预算尾部：从后向前遍历，找出要保留多少最近消息
         accumulated = 0
         cut_idx = len(body)
         for i in range(len(body) - 1, -1, -1):
@@ -719,7 +750,7 @@ class AgentLoop:
             accumulated += msg_tokens
             cut_idx = i
 
-        # Don't split in the middle of a tool_call/tool_result pair
+        # 避免在 tool_call/tool_result 配对中间切割
         while 0 < cut_idx < len(body) and body[cut_idx].get("role") == "tool":
             cut_idx += 1
 
@@ -727,28 +758,30 @@ class AgentLoop:
         tail = body[cut_idx:]
 
         if not head:
-            # All body fits in tail budget — force a split to avoid infinite loop
+            # 所有内容都在尾部预算内 — 强制分割以避免无限循环
             if len(body) > 2:
                 cut_idx = max(1, len(body) // 2)
                 head = body[:cut_idx]
                 tail = body[cut_idx:]
             else:
-                logger.warning("Auto compact: nothing to compress (body too small)")
+                logger.warning("Auto compact: 无需压缩（内容太少）")
                 return
 
-        # Build focus section
+        # 构建 focus 部分
         focus_section = _FOCUS_SECTION.format(topic=focus_topic) if focus_topic else ""
 
-        # Build summary prompt (structured template or iterative update)
+        # 构建摘要提示（结构化模板或迭代更新）
         conv_text = json.dumps(head, default=str, ensure_ascii=False)[:80000]
 
         if self._previous_summary:
+            # 迭代更新：基于之前的摘要继续更新
             prompt = _ITERATIVE_UPDATE_PROMPT.format(
                 previous_summary=self._previous_summary,
                 new_turns=conv_text,
                 focus_section=focus_section,
             )
         else:
+            # 首次压缩：使用结构化摘要模板
             prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
 
         summary_resp = self.llm.chat([{"role": "user", "content": prompt}])
@@ -760,7 +793,7 @@ class AgentLoop:
                       "focus_topic": focus_topic or "(none)"})
         self._emit("compact", {"tokens_before": tokens_before, "summary": summary[:200]})
 
-        # Reconstruct: system + summary + acknowledge + preserved tail
+        # 重建消息结构：system + 摘要 + 确认 + 保留的尾部
         state_summary = self.memory.to_summary()
         compressed = f"[Conversation compressed — handoff summary. Transcript: {transcript_path}]\n\n{summary}"
         if state_summary and state_summary != "(empty state)":
@@ -772,7 +805,7 @@ class AgentLoop:
         messages.append({"role": "assistant", "content": "Understood. Continuing from the summary."})
         messages.extend(tail)
 
-        # Fix orphaned tool pairs in the reconstructed message list
+        # 修复重建后消息列表中的孤立工具配对
         _fix_tool_pairs(messages)
 
     def _emit(self, event_type: str, data: Dict[str, Any]) -> None:

@@ -54,6 +54,9 @@ dependencies = [
     "matplotlib>=3.7.0",
     "weasyprint>=60.0",
     "pyarrow>=24.0.0",
+    "pytest>=9.0.3",
+    "exchange-calendars>=4.13.2",
+    "apscheduler>=3.11.2",
 ]
 
 [project.urls]
@@ -93,6 +96,9 @@ dev = [
     "pytest-cov>=4.0",
 ]
 
+[tool.uv]
+package = true
+
 [tool.pytest.ini_options]
 testpaths = ["agent/tests"]
 pythonpath = ["agent"]
@@ -109,3 +115,8 @@ src = ["agent"]
 [tool.ruff.lint]
 select = ["E", "F", "W"]
 ignore = ["E501"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.15",
+]

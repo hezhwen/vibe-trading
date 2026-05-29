@@ -57,6 +57,7 @@ dependencies = [
     "pytest>=9.0.3",
     "exchange-calendars>=4.13.2",
     "apscheduler>=3.11.2",
+    "stockstats>=0.6.0",
 ]
 
 [project.urls]
